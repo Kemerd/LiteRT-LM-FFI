@@ -142,7 +142,8 @@ static extern IntPtr litert_lm_engine_create(IntPtr settings);
 
 The build scripts temporarily inject a `cc_binary(linkshared=True)` target into LiteRT-LM's Bazel build, compile it, copy the output, then clean up. Your LiteRT-LM checkout is left untouched.
 
-Key Windows-specific fixes included:
+Key technical details:
+- **`alwayslink = True`**: An intermediate `cc_library` wraps the `:engine` dependency with `alwayslink = True`. Without this, the linker (especially MSVC on Windows) garbage-collects `engine.obj` because nothing in `capi_dll_entry.cc` directly references its symbols. The `__declspec(dllexport)` annotations in `engine.cc` only work if the object is actually linked in — `alwayslink` forces inclusion of all objects.
 - Sets `BAZEL_SH` to Git Bash (avoids WSL requirement)
 - Sets `BAZEL_VC` to auto-detect MSVC (avoids broken auto-detection)
 - Uses short `--output_user_root=C:/b` (avoids 260-char path limit from Rust intermediate files)
