@@ -19,13 +19,19 @@
     Path to a LiteRT-LM source checkout. If not provided, the script
     searches common locations or prompts you to clone.
 
+.PARAMETER Clean
+    Wipe the Bazel cache before building (bazel clean --expunge).
+    Use this after changing the build script or when Bazel serves stale artifacts.
+
 .EXAMPLE
     .\build_windows.ps1
-    .\build_windows.ps1 -LiteRtLmDir "C:\Projects\LiteRT-LM"
+    .\build_windows.ps1 -Clean
+    .\build_windows.ps1 -LiteRtLmDir "C:\Projects\LiteRT-LM" -Clean
 #>
 
 param(
-    [string]$LiteRtLmDir = ""
+    [string]$LiteRtLmDir = "",
+    [switch]$Clean
 )
 
 # Note: we do NOT use $ErrorActionPreference = "Stop" globally because
@@ -106,6 +112,16 @@ if (-not $bazel) {
 }
 Write-Host "  Bazel: $bazel" -ForegroundColor Green
 
+# Run -Clean if requested (wipe Bazel cache entirely)
+if ($Clean) {
+    Write-Host ""
+    Write-Host "Running bazel clean --expunge (this wipes the entire cache)..." -ForegroundColor Yellow
+    Push-Location $LiteRtLmDir
+    & $bazel clean --expunge 2>&1 | ForEach-Object { Write-Host "  $_" }
+    Pop-Location
+    Write-Host "  Cache purged." -ForegroundColor Green
+}
+
 # Check MSVC
 $clExe = Get-Command "cl.exe" -ErrorAction SilentlyContinue
 if (-not $clExe) {
@@ -130,7 +146,11 @@ Write-Host "Setting up build target..." -ForegroundColor Gray
 
 $BuildFile = "$LiteRtLmDir\c\BUILD"
 $StubFile = "$LiteRtLmDir\c\capi_dll_entry.cc"
+$HeaderFile = "$LiteRtLmDir\c\engine.h"
+$SourceFile = "$LiteRtLmDir\c\engine.cc"
 $BuildBackup = "$BuildFile.litert_lm_ffi_backup"
+$HeaderBackup = "$HeaderFile.litert_lm_ffi_backup"
+$SourceBackup = "$SourceFile.litert_lm_ffi_backup"
 
 # Strip any leftover targets from previous runs
 $buildContent = Get-Content -Path $BuildFile -Raw
@@ -145,6 +165,66 @@ if ($buildContent -match [regex]::Escape($marker)) {
 }
 
 Copy-Item -Path $BuildFile -Destination $BuildBackup -Force
+Copy-Item -Path $HeaderFile -Destination $HeaderBackup -Force
+Copy-Item -Path $SourceFile -Destination $SourceBackup -Force
+
+# ============================================================================
+# Patch engine.h: add litert_lm_engine_settings_set_dispatch_lib_dir
+# ============================================================================
+# The upstream C API is missing a setter for the LiteRT dispatch library
+# directory. Without it, the GPU/WebGPU accelerator can't find its DLLs
+# (libLiteRtWebGpuAccelerator.dll, etc.) and crashes during init.
+
+$headerContent = Get-Content -Path $HeaderFile -Raw
+$dispatchDeclMarker = "litert_lm_engine_settings_set_dispatch_lib_dir"
+if ($headerContent -notmatch [regex]::Escape($dispatchDeclMarker)) {
+    $patchDecl = @"
+
+// Sets the LiteRT dispatch library directory. This tells the runtime where
+// to find accelerator DLLs (e.g. libLiteRtWebGpuAccelerator.dll). If not
+// set, the runtime searches environment variables / system PATH, which
+// may fail for bundled apps.
+//
+// @param settings The engine settings.
+// @param dir The directory containing LiteRT accelerator libraries.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_dispatch_lib_dir(
+    LiteRtLmEngineSettings* settings, const char* dir);
+
+"@
+    $headerContent = $headerContent -replace '(?m)(#ifdef __cplusplus\r?\n\}  // extern "C")', "$patchDecl`$1"
+    Set-Content -Path $HeaderFile -Value $headerContent -Encoding UTF8 -NoNewline
+    Write-Host "  Patched engine.h: added set_dispatch_lib_dir declaration" -ForegroundColor Green
+}
+
+# ============================================================================
+# Patch engine.cc: implement litert_lm_engine_settings_set_dispatch_lib_dir
+# ============================================================================
+
+$sourceContent = Get-Content -Path $SourceFile -Raw
+if ($sourceContent -notmatch [regex]::Escape($dispatchDeclMarker)) {
+    $patchImpl = @"
+
+void litert_lm_engine_settings_set_dispatch_lib_dir(
+    LiteRtLmEngineSettings* settings, const char* dir) {
+  if (settings && settings->settings && dir) {
+    // Set on main executor — this is where the GPU/WebGPU accelerator
+    // (libLiteRtWebGpuAccelerator.dll) gets loaded from.
+    settings->settings->GetMutableMainExecutorSettings()
+        .SetLitertDispatchLibDir(dir);
+    // Also set on vision executor if it exists (returns std::optional).
+    auto vision = settings->settings->GetMutableVisionExecutorSettings();
+    if (vision.has_value()) {
+      vision->SetLitertDispatchLibDir(dir);
+    }
+  }
+}
+
+"@
+    $sourceContent = $sourceContent -replace '(?m)(^\}  // extern "C")', "$patchImpl`$1"
+    Set-Content -Path $SourceFile -Value $sourceContent -Encoding UTF8 -NoNewline
+    Write-Host "  Patched engine.cc: added set_dispatch_lib_dir implementation" -ForegroundColor Green
+}
 
 # Stub source that explicitly references every C API function.
 # This is the nuclear option: even if alwayslink is defeated by Bazel flags
@@ -178,6 +258,7 @@ volatile const void* litert_lm_force_exports[] = {
     (const void*)&litert_lm_engine_settings_delete,
     (const void*)&litert_lm_engine_settings_set_max_num_tokens,
     (const void*)&litert_lm_engine_settings_set_cache_dir,
+    (const void*)&litert_lm_engine_settings_set_dispatch_lib_dir,
     (const void*)&litert_lm_engine_settings_set_activation_data_type,
     (const void*)&litert_lm_engine_settings_enable_benchmark,
     (const void*)&litert_lm_engine_create,
@@ -336,6 +417,16 @@ try {
         Copy-Item -Path $BuildBackup -Destination $BuildFile -Force
         Remove-Item -Path $BuildBackup -Force
         Write-Host "  Restored original c/BUILD" -ForegroundColor Green
+    }
+    if (Test-Path $HeaderBackup) {
+        Copy-Item -Path $HeaderBackup -Destination $HeaderFile -Force
+        Remove-Item -Path $HeaderBackup -Force
+        Write-Host "  Restored original c/engine.h" -ForegroundColor Green
+    }
+    if (Test-Path $SourceBackup) {
+        Copy-Item -Path $SourceBackup -Destination $SourceFile -Force
+        Remove-Item -Path $SourceBackup -Force
+        Write-Host "  Restored original c/engine.cc" -ForegroundColor Green
     }
     if (Test-Path $StubFile) {
         Remove-Item -Path $StubFile -Force

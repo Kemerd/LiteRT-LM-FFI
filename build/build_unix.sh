@@ -11,12 +11,22 @@
 #
 # Usage:
 #   ./build_unix.sh [/path/to/LiteRT-LM]
+#   ./build_unix.sh --clean [/path/to/LiteRT-LM]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LITERT_LM_DIR="${1:-}"
+
+# Parse --clean flag
+CLEAN=false
+LITERT_LM_DIR=""
+for arg in "$@"; do
+    case "$arg" in
+        --clean) CLEAN=true ;;
+        *)       LITERT_LM_DIR="$arg" ;;
+    esac
+done
 
 echo ""
 echo "============================================"
@@ -100,6 +110,15 @@ if [ -z "$BAZEL" ]; then
     echo "  Install: npm install -g @bazel/bazelisk" >&2
     exit 1
 fi
+
+# Run --clean if requested (wipe Bazel cache entirely)
+if [ "$CLEAN" = true ]; then
+    echo ""
+    echo "Running bazel clean --expunge (this wipes the entire cache)..."
+    (cd "$LITERT_LM_DIR" && $BAZEL clean --expunge)
+    echo "  Cache purged."
+fi
+
 echo ""
 
 # ============================================================================
@@ -110,9 +129,70 @@ echo "Setting up build target..."
 
 BUILD_FILE="$LITERT_LM_DIR/c/BUILD"
 STUB_FILE="$LITERT_LM_DIR/c/capi_dll_entry.cc"
+HEADER_FILE="$LITERT_LM_DIR/c/engine.h"
+SOURCE_FILE="$LITERT_LM_DIR/c/engine.cc"
 BUILD_BACKUP="$BUILD_FILE.litert_lm_ffi_backup"
+HEADER_BACKUP="$HEADER_FILE.litert_lm_ffi_backup"
+SOURCE_BACKUP="$SOURCE_FILE.litert_lm_ffi_backup"
 
 cp "$BUILD_FILE" "$BUILD_BACKUP"
+cp "$HEADER_FILE" "$HEADER_BACKUP"
+cp "$SOURCE_FILE" "$SOURCE_BACKUP"
+
+# ============================================================================
+# Patch engine.h: add litert_lm_engine_settings_set_dispatch_lib_dir
+# ============================================================================
+# The upstream C API is missing a setter for the LiteRT dispatch library
+# directory. Without it, the GPU/WebGPU accelerator can't find its shared
+# libraries (libLiteRtWebGpuAccelerator.so, etc.) and crashes during init.
+
+if ! grep -q "litert_lm_engine_settings_set_dispatch_lib_dir" "$HEADER_FILE"; then
+    # Insert declaration before the closing extern "C" brace
+    sed -i.bak '/#ifdef __cplusplus/{
+        i\
+\
+// Sets the LiteRT dispatch library directory. This tells the runtime where\
+// to find accelerator shared libs (e.g. libLiteRtWebGpuAccelerator.so). If\
+// not set, the runtime searches environment variables / system paths, which\
+// may fail for bundled apps.\
+//\
+// @param settings The engine settings.\
+// @param dir The directory containing LiteRT accelerator libraries.\
+LITERT_LM_C_API_EXPORT\
+void litert_lm_engine_settings_set_dispatch_lib_dir(\
+    LiteRtLmEngineSettings* settings, const char* dir);\
+
+    }' "$HEADER_FILE"
+    rm -f "$HEADER_FILE.bak"
+    echo "  Patched engine.h: added set_dispatch_lib_dir declaration"
+fi
+
+# ============================================================================
+# Patch engine.cc: implement litert_lm_engine_settings_set_dispatch_lib_dir
+# ============================================================================
+
+if ! grep -q "litert_lm_engine_settings_set_dispatch_lib_dir" "$SOURCE_FILE"; then
+    # Insert implementation before the closing }  // extern "C"
+    sed -i.bak '/^}  \/\/ extern "C"/i\
+\
+void litert_lm_engine_settings_set_dispatch_lib_dir(\
+    LiteRtLmEngineSettings* settings, const char* dir) {\
+  if (settings \&\& settings->settings \&\& dir) {\
+    // Set on main executor — this is where the GPU/WebGPU accelerator\
+    // (libLiteRtWebGpuAccelerator.so) gets loaded from.\
+    settings->settings->GetMutableMainExecutorSettings()\
+        .SetLitertDispatchLibDir(dir);\
+    // Also set on vision executor if it exists (returns std::optional).\
+    auto vision = settings->settings->GetMutableVisionExecutorSettings();\
+    if (vision.has_value()) {\
+      vision->SetLitertDispatchLibDir(dir);\
+    }\
+  }\
+}\
+' "$SOURCE_FILE"
+    rm -f "$SOURCE_FILE.bak"
+    echo "  Patched engine.cc: added set_dispatch_lib_dir implementation"
+fi
 
 cat > "$STUB_FILE" << 'EOF'
 // =======================================================================
@@ -133,6 +213,7 @@ volatile const void* litert_lm_force_exports[] = {
     (const void*)&litert_lm_engine_settings_delete,
     (const void*)&litert_lm_engine_settings_set_max_num_tokens,
     (const void*)&litert_lm_engine_settings_set_cache_dir,
+    (const void*)&litert_lm_engine_settings_set_dispatch_lib_dir,
     (const void*)&litert_lm_engine_settings_set_activation_data_type,
     (const void*)&litert_lm_engine_settings_enable_benchmark,
     (const void*)&litert_lm_engine_create,
@@ -208,6 +289,16 @@ cleanup() {
         cp "$BUILD_BACKUP" "$BUILD_FILE"
         rm -f "$BUILD_BACKUP"
         echo "  Restored original c/BUILD"
+    fi
+    if [ -f "$HEADER_BACKUP" ]; then
+        cp "$HEADER_BACKUP" "$HEADER_FILE"
+        rm -f "$HEADER_BACKUP"
+        echo "  Restored original c/engine.h"
+    fi
+    if [ -f "$SOURCE_BACKUP" ]; then
+        cp "$SOURCE_BACKUP" "$SOURCE_FILE"
+        rm -f "$SOURCE_BACKUP"
+        echo "  Restored original c/engine.cc"
     fi
     if [ -f "$STUB_FILE" ]; then
         rm -f "$STUB_FILE"

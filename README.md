@@ -144,6 +144,8 @@ The build scripts temporarily inject a `cc_binary(linkshared=True)` target into 
 
 Key technical details:
 - **`alwayslink = True`**: An intermediate `cc_library` wraps the `:engine` dependency with `alwayslink = True`. Without this, the linker (especially MSVC on Windows) garbage-collects `engine.obj` because nothing in `capi_dll_entry.cc` directly references its symbols. The `__declspec(dllexport)` annotations in `engine.cc` only work if the object is actually linked in — `alwayslink` forces inclusion of all objects.
+- **`set_dispatch_lib_dir` patch**: The upstream C API is missing a setter for `litert_dispatch_lib_dir`, which tells the LiteRT runtime where to find GPU accelerator shared libraries (e.g. `libLiteRtWebGpuAccelerator.dll/.so`). Without it, GPU/WebGPU initialization crashes because the runtime can't locate its dependencies. The build scripts temporarily patch `engine.h` and `engine.cc` to add `litert_lm_engine_settings_set_dispatch_lib_dir()`, then restore the originals after compilation.
+- **`--clean` flag**: Pass `-Clean` (Windows) or `--clean` (Unix) to wipe the Bazel cache with `bazel clean --expunge` before building. Useful when switching branches or after editing the build script itself.
 - Sets `BAZEL_SH` to Git Bash (avoids WSL requirement)
 - Sets `BAZEL_VC` to auto-detect MSVC (avoids broken auto-detection)
 - Uses short `--output_user_root=C:/b` (avoids 260-char path limit from Rust intermediate files)
