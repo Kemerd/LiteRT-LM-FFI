@@ -250,6 +250,44 @@ PATCHEOF
 fi
 
 # ============================================================================
+# Patch build_config + constrained_decoding BUILD for macOS x86_64
+# ============================================================================
+# The upstream BUILD uses "@platforms//os:macos" which catches BOTH arm64 and
+# x86_64, but links prebuilt/macos_arm64 libs — arm64 binaries that the x86_64
+# linker rejects ("unknown file type"). We add a more specific macos_x86_64
+# config that selects before the generic macos entry and uses an empty list
+# (constrained decoding is optional; the engine falls back gracefully).
+
+BUILD_CONFIG="$LITERT_LM_DIR/build_config/BUILD"
+CONSTRAINED_BUILD="$LITERT_LM_DIR/runtime/components/constrained_decoding/BUILD"
+
+if [ "$NATIVE_ARCH" = "macos_x86_64" ]; then
+    if [ -f "$BUILD_CONFIG" ] && ! grep -q "macos_x86_64" "$BUILD_CONFIG"; then
+        BUILD_CONFIG_BACKUP="$BUILD_CONFIG.flutter_gemma_backup"
+        cp "$BUILD_CONFIG" "$BUILD_CONFIG_BACKUP"
+        cat >> "$BUILD_CONFIG" << 'BLDCFG'
+
+config_setting(
+    name = "macos_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+BLDCFG
+        echo "  Added macos_x86_64 config_setting to build_config/BUILD"
+    fi
+
+    if [ -f "$CONSTRAINED_BUILD" ] && ! grep -q "macos_x86_64" "$CONSTRAINED_BUILD"; then
+        CONSTRAINED_BACKUP="$CONSTRAINED_BUILD.flutter_gemma_backup"
+        cp "$CONSTRAINED_BUILD" "$CONSTRAINED_BACKUP"
+        sed -i.bak 's|"@platforms//os:macos": \["//prebuilt/macos_arm64:libGemmaModelConstraintProvider.dylib"\]|"//build_config:macos_x86_64": [],\n        "@platforms//os:macos": ["//prebuilt/macos_arm64:libGemmaModelConstraintProvider.dylib"]|' "$CONSTRAINED_BUILD"
+        rm -f "$CONSTRAINED_BUILD.bak"
+        echo "  Patched constrained_decoding BUILD: x86_64 uses empty srcs"
+    fi
+fi
+
+# ============================================================================
 # Patch engine.h: add litert_lm_engine_settings_set_dispatch_lib_dir
 # ============================================================================
 # The upstream C API is missing a setter for the LiteRT dispatch library
@@ -257,22 +295,39 @@ fi
 # libraries (libLiteRtWebGpuAccelerator.so, etc.) and crashes during init.
 
 if ! grep -q "litert_lm_engine_settings_set_dispatch_lib_dir" "$HEADER_FILE"; then
-    sed -i.bak '/#ifdef __cplusplus/{
-        i\
-\
-// Sets the LiteRT dispatch library directory. This tells the runtime where\
-// to find accelerator shared libs (e.g. libLiteRtWebGpuAccelerator.so). If\
-// not set, the runtime searches environment variables / system paths, which\
-// may fail for bundled apps.\
-//\
-// @param settings The engine settings.\
-// @param dir The directory containing LiteRT accelerator libraries.\
-LITERT_LM_C_API_EXPORT\
-void litert_lm_engine_settings_set_dispatch_lib_dir(\
-    LiteRtLmEngineSettings* settings, const char* dir);\
+    # Insert the new declaration inside the extern "C" block, right before
+    # the closing "#ifdef __cplusplus / } // extern "C" / #endif" triplet.
+    # We use Python for reliable multi-line matching — BSD sed can't do this.
+    python3 - "$HEADER_FILE" << 'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, "r") as f:
+    content = f.read()
 
-    }' "$HEADER_FILE"
-    rm -f "$HEADER_FILE.bak"
+decl = (
+    "\n"
+    "// Sets the LiteRT dispatch library directory. This tells the runtime where\n"
+    "// to find accelerator shared libs (e.g. libLiteRtWebGpuAccelerator.so). If\n"
+    "// not set, the runtime searches environment variables / system paths, which\n"
+    "// may fail for bundled apps.\n"
+    "//\n"
+    "// @param settings The engine settings.\n"
+    "// @param dir The directory containing LiteRT accelerator libraries.\n"
+    "LITERT_LM_C_API_EXPORT\n"
+    "void litert_lm_engine_settings_set_dispatch_lib_dir(\n"
+    "    LiteRtLmEngineSettings* settings, const char* dir);\n"
+)
+
+# Target the unique closing block of extern "C"
+closing = '#ifdef __cplusplus\n}  // extern "C"\n#endif'
+if closing in content:
+    content = content.replace(closing, decl + "\n" + closing, 1)
+else:
+    sys.exit("ERROR: Could not find extern C closing block in engine.h")
+
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
     echo "  Patched engine.h: added set_dispatch_lib_dir declaration"
 fi
 
@@ -456,6 +511,16 @@ cleanup() {
         rm -f "$LOCKFILE_BACKUP"
         echo "  Restored original cargo-bazel-lock.json"
     fi
+    if [ -n "${BUILD_CONFIG_BACKUP:-}" ] && [ -f "$BUILD_CONFIG_BACKUP" ]; then
+        cp "$BUILD_CONFIG_BACKUP" "$BUILD_CONFIG"
+        rm -f "$BUILD_CONFIG_BACKUP"
+        echo "  Restored original build_config/BUILD"
+    fi
+    if [ -n "${CONSTRAINED_BACKUP:-}" ] && [ -f "$CONSTRAINED_BACKUP" ]; then
+        cp "$CONSTRAINED_BACKUP" "$CONSTRAINED_BUILD"
+        rm -f "$CONSTRAINED_BACKUP"
+        echo "  Restored original constrained_decoding/BUILD"
+    fi
 }
 trap cleanup EXIT
 
@@ -481,7 +546,44 @@ BAZEL_MACOS_FLAGS=""
 if [ "$OS" = "Darwin" ]; then
     XCODE_DEV_DIR="$(xcode-select -p 2>/dev/null || echo "")"
     if [ -n "$XCODE_DEV_DIR" ]; then
-        BAZEL_MACOS_FLAGS="--repo_env=DEVELOPER_DIR=$XCODE_DEV_DIR"
+        BAZEL_MACOS_FLAGS="--repo_env=DEVELOPER_DIR=$XCODE_DEV_DIR --action_env=DEVELOPER_DIR=$XCODE_DEV_DIR"
+
+        # ---------------------------------------------------------------
+        # Fix for non-standard Xcode locations (e.g. /Volumes/NVMe/Xcode.app)
+        # ---------------------------------------------------------------
+        # Apple's Bazel toolchain (build_bazel_apple_support) hardcodes
+        # cxx_builtin_include_directories to /Applications/, /Library/, etc.
+        # If Xcode is installed elsewhere (external drive, custom path),
+        # Bazel rejects every system header as "absolute path inclusion".
+        # We patch the generated BUILD to add the real Xcode volume prefix.
+        XCODE_PREFIX=$(dirname "$(dirname "$XCODE_DEV_DIR")")  # e.g. /Volumes/NVMe/Xcode.app
+        XCODE_VOLUME=$(echo "$XCODE_PREFIX" | cut -d'/' -f1-3)  # e.g. /Volumes/NVMe
+        if [[ "$XCODE_VOLUME" != "/Applications" ]]; then
+            echo "  Non-standard Xcode path detected ($XCODE_PREFIX)"
+            echo "  Running 'bazel fetch' to generate toolchain config..."
+
+            # Fetch forces Bazel to generate local_config_apple_cc/BUILD
+            # without compiling anything, so we can patch it before the build.
+            # shellcheck disable=SC2086
+            CARGO_BAZEL_REPIN=true $BAZEL fetch $BAZEL_TARGET $BAZEL_MACOS_FLAGS 2>&1 || true
+
+            APPLE_CC_BUILD=""
+            for candidate in /private/var/tmp/_bazel_"$USER"/*/external/local_config_apple_cc/BUILD; do
+                if [ -f "$candidate" ]; then
+                    APPLE_CC_BUILD="$candidate"
+                    break
+                fi
+            done
+            if [ -n "$APPLE_CC_BUILD" ] && ! grep -q "$XCODE_VOLUME" "$APPLE_CC_BUILD"; then
+                sed -i.bak "s|cxx_builtin_include_directories = \[|cxx_builtin_include_directories = [\n            \"$XCODE_VOLUME/\",|" "$APPLE_CC_BUILD"
+                rm -f "$APPLE_CC_BUILD.bak"
+                echo "  Patched cc_toolchain: added $XCODE_VOLUME/ to builtin includes"
+            elif [ -z "$APPLE_CC_BUILD" ]; then
+                echo "  WARNING: Could not find local_config_apple_cc/BUILD to patch"
+            else
+                echo "  cc_toolchain already includes $XCODE_VOLUME/"
+            fi
+        fi
     fi
 fi
 
