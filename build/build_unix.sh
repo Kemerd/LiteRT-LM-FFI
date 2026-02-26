@@ -14,12 +14,15 @@
 #                (iOS builds also need Xcode + Apple SDK)
 #
 # Usage:
-#   ./build_unix.sh [--clean] [--ios] [--ios-sim] [/path/to/LiteRT-LM]
+#   ./build_unix.sh [flags...] [/path/to/LiteRT-LM]
 #
 # Flags:
-#   --clean    Wipe Bazel cache before building (full rebuild)
-#   --ios      Cross-compile for iOS device (arm64, static library)
-#   --ios-sim  Cross-compile for iOS simulator (arm64, static library)
+#   --clean       Wipe Bazel cache before building (full rebuild)
+#   --ios         Cross-compile for iOS device (arm64, static library)
+#   --ios-sim     Cross-compile for iOS simulator (arm64, static library)
+#   --macos-arm64 Cross-compile macOS arm64 dylib (from Intel host)
+#   --macos-x86   Cross-compile macOS x86_64 dylib (from arm64 host)
+#   --all-apple   Build all Apple targets (macOS arm64+x86, iOS, iOS sim)
 
 set -e
 
@@ -33,16 +36,51 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLEAN=false
 IOS_DEVICE=false
 IOS_SIM=false
+MACOS_ARM64=false
+MACOS_X86=false
+ALL_APPLE=false
 LITERT_LM_DIR=""
 
 for arg in "$@"; do
     case "$arg" in
-        --clean)   CLEAN=true ;;
-        --ios)     IOS_DEVICE=true ;;
-        --ios-sim) IOS_SIM=true ;;
-        *)         LITERT_LM_DIR="$arg" ;;
+        --clean)       CLEAN=true ;;
+        --ios)         IOS_DEVICE=true ;;
+        --ios-sim)     IOS_SIM=true ;;
+        --macos-arm64) MACOS_ARM64=true ;;
+        --macos-x86)   MACOS_X86=true ;;
+        --all-apple)   ALL_APPLE=true ;;
+        *)             LITERT_LM_DIR="$arg" ;;
     esac
 done
+
+# --all-apple is a convenience shortcut that recursively invokes this script
+# for each Apple target, then exits. Passes through --clean and source path.
+if [ "$ALL_APPLE" = true ]; then
+    echo ""
+    echo "============================================"
+    echo "  Building ALL Apple targets"
+    echo "============================================"
+    echo ""
+    PASSTHROUGH_ARGS=""
+    [ "$CLEAN" = true ] && PASSTHROUGH_ARGS="--clean"
+    [ -n "$LITERT_LM_DIR" ] && PASSTHROUGH_ARGS="$PASSTHROUGH_ARGS $LITERT_LM_DIR"
+
+    TARGETS=("--macos-arm64" "--macos-x86" "--ios" "--ios-sim")
+    for target in "${TARGETS[@]}"; do
+        echo ">>> Building $target ..."
+        echo ""
+        # shellcheck disable=SC2086
+        bash "$0" "$target" $PASSTHROUGH_ARGS
+        # Only clean on the first pass — no need to nuke cache between targets
+        PASSTHROUGH_ARGS="${PASSTHROUGH_ARGS/--clean/}"
+        echo ""
+    done
+
+    echo "============================================"
+    echo "  All Apple targets built successfully!"
+    echo "============================================"
+    exit 0
+fi
 
 echo ""
 echo "============================================"
@@ -89,11 +127,13 @@ if [ "$IOS_DEVICE" = true ]; then
     # -----------------------------------------------------------------------
     # iOS device (arm64) — produces a static library (.a)
     # Dynamic libraries (.dylib) are not allowed on non-jailbroken iOS.
+    # Uses LiteRT-LM's .bazelrc config which sets --cpu, --platforms, and
+    # --apple_platform_type correctly for cross-compilation.
     # -----------------------------------------------------------------------
     NATIVE_ARCH="ios_arm64"
     LIB_EXT="a"
     BUILD_STATIC=true
-    BAZEL_EXTRA="--apple_platform_type=ios --cpu=ios_arm64"
+    BAZEL_EXTRA="--config=ios_arm64"
     echo "Target: iOS device (arm64, static library)"
 
 elif [ "$IOS_SIM" = true ]; then
@@ -103,12 +143,39 @@ elif [ "$IOS_SIM" = true ]; then
     NATIVE_ARCH="ios_sim_arm64"
     LIB_EXT="a"
     BUILD_STATIC=true
-    BAZEL_EXTRA="--apple_platform_type=ios --cpu=ios_sim_arm64"
+    BAZEL_EXTRA="--config=ios_sim_arm64"
     echo "Target: iOS simulator (arm64, static library)"
+
+elif [ "$MACOS_ARM64" = true ]; then
+    # -----------------------------------------------------------------------
+    # Cross-compile macOS arm64 (Apple Silicon) from any macOS host.
+    # Uses the .bazelrc macos_arm64 config which sets --cpu=darwin_arm64,
+    # --platforms=@build_bazel_apple_support//platforms:darwin_arm64, and
+    # --macos_minimum_os=11.0. The --platforms flag is critical — without it
+    # the Apple Bazel toolchain doesn't correctly cross-compile ARM assembly
+    # (XNNPACK/KleidiAI .S files fail with "unknown directive").
+    # -----------------------------------------------------------------------
+    NATIVE_ARCH="macos_arm64"
+    LIB_EXT="dylib"
+    BUILD_STATIC=false
+    BAZEL_EXTRA="--config=macos_arm64"
+    echo "Target: macOS arm64 (Apple Silicon, cross-compile)"
+
+elif [ "$MACOS_X86" = true ]; then
+    # -----------------------------------------------------------------------
+    # Cross-compile macOS x86_64 (Intel) from any macOS host.
+    # No predefined .bazelrc config exists for x86_64, so we pass flags
+    # directly — the platform constraints just need os:macos + cpu:x86_64.
+    # -----------------------------------------------------------------------
+    NATIVE_ARCH="macos_x86_64"
+    LIB_EXT="dylib"
+    BUILD_STATIC=false
+    BAZEL_EXTRA="--cpu=darwin_x86_64 --platforms=@build_bazel_apple_support//platforms:darwin_x86_64"
+    echo "Target: macOS x86_64 (Intel, cross-compile)"
 
 elif [ "$OS" = "Darwin" ]; then
     # -----------------------------------------------------------------------
-    # macOS — shared library (.dylib), works on both arm64 and x86_64.
+    # macOS native — auto-detects host architecture.
     # LiteRT-LM runs on CPU on all three desktop OSes; there's zero reason
     # to gate macOS builds to arm64 only when Linux x86_64 works fine.
     # -----------------------------------------------------------------------
@@ -246,6 +313,32 @@ PATCHEOF
         echo "  Patched PATCH.rules_rust: added x86_64-apple-darwin triple"
     else
         echo "  PATCH.rules_rust already has x86_64-apple-darwin"
+    fi
+fi
+
+# ============================================================================
+# Patch WORKSPACE: add cross-compilation Rust target triples
+# ============================================================================
+# When cross-compiling (e.g. arm64 from x86_64 host, or iOS from macOS),
+# rules_rust needs the target triple registered in extra_target_triples.
+# The upstream WORKSPACE only has mobile triples + the host desktop triple.
+# We add any missing triples needed for our target architecture.
+
+WORKSPACE_FILE="$LITERT_LM_DIR/WORKSPACE"
+if [ -f "$WORKSPACE_FILE" ]; then
+    NEEDS_WORKSPACE_PATCH=false
+
+    if [ "$NATIVE_ARCH" = "macos_arm64" ] && ! grep -q '"aarch64-apple-darwin"' "$WORKSPACE_FILE"; then
+        NEEDS_WORKSPACE_PATCH=true
+    fi
+
+    if [ "$NEEDS_WORKSPACE_PATCH" = true ]; then
+        WORKSPACE_BACKUP="$WORKSPACE_FILE.litert_lm_ffi_backup"
+        cp "$WORKSPACE_FILE" "$WORKSPACE_BACKUP"
+
+        sed -i.bak 's|"aarch64-linux-android",|"aarch64-linux-android",\n        "aarch64-apple-darwin",|' "$WORKSPACE_FILE"
+        rm -f "$WORKSPACE_FILE.bak"
+        echo "  Patched WORKSPACE: added aarch64-apple-darwin to Rust target triples"
     fi
 fi
 
@@ -520,6 +613,11 @@ cleanup() {
         cp "$CONSTRAINED_BACKUP" "$CONSTRAINED_BUILD"
         rm -f "$CONSTRAINED_BACKUP"
         echo "  Restored original constrained_decoding/BUILD"
+    fi
+    if [ -n "${WORKSPACE_BACKUP:-}" ] && [ -f "$WORKSPACE_BACKUP" ]; then
+        cp "$WORKSPACE_BACKUP" "$WORKSPACE_FILE"
+        rm -f "$WORKSPACE_BACKUP"
+        echo "  Restored original WORKSPACE"
     fi
 }
 trap cleanup EXIT
