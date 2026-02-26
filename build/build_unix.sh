@@ -1,30 +1,46 @@
 #!/bin/bash
 #
-# Builds the LiteRT-LM C API as a shared library (.so / .dylib)
+# Builds the LiteRT-LM C API as a shared library (.so / .dylib / .a)
 #
-# Uses Bazel to compile from source. Run this ONCE.
+# Uses Bazel to compile from source. Run this ONCE per platform.
 # Output goes to prebuilt/<platform>/.
 #
-# Supports: Linux (x86_64, arm64), macOS (arm64)
+# Supports:
+#   macOS  — arm64 (Apple Silicon), x86_64 (Intel)
+#   iOS    — arm64 (device), arm64_sim (simulator)
+#   Linux  — x86_64, aarch64
 #
 # Prerequisites: bazelisk/bazel, clang, python3, git
+#                (iOS builds also need Xcode + Apple SDK)
 #
 # Usage:
-#   ./build_unix.sh [/path/to/LiteRT-LM]
-#   ./build_unix.sh --clean [/path/to/LiteRT-LM]
+#   ./build_unix.sh [--clean] [--ios] [--ios-sim] [/path/to/LiteRT-LM]
+#
+# Flags:
+#   --clean    Wipe Bazel cache before building (full rebuild)
+#   --ios      Cross-compile for iOS device (arm64, static library)
+#   --ios-sim  Cross-compile for iOS simulator (arm64, static library)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Parse --clean flag
+# ============================================================================
+# Parse flags
+# ============================================================================
+
 CLEAN=false
+IOS_DEVICE=false
+IOS_SIM=false
 LITERT_LM_DIR=""
+
 for arg in "$@"; do
     case "$arg" in
-        --clean) CLEAN=true ;;
-        *)       LITERT_LM_DIR="$arg" ;;
+        --clean)   CLEAN=true ;;
+        --ios)     IOS_DEVICE=true ;;
+        --ios-sim) IOS_SIM=true ;;
+        *)         LITERT_LM_DIR="$arg" ;;
     esac
 done
 
@@ -35,8 +51,10 @@ echo "============================================"
 echo ""
 
 # ============================================================================
-# Resolve LiteRT-LM source
+# Resolve LiteRT-LM source directory
 # ============================================================================
+# Searches common locations relative to this repo and user home.
+# Pass an explicit path as the first non-flag argument to override.
 
 if [ -z "$LITERT_LM_DIR" ]; then
     for candidate in \
@@ -53,41 +71,79 @@ fi
 if [ -z "$LITERT_LM_DIR" ] || [ ! -f "$LITERT_LM_DIR/c/engine.h" ]; then
     echo "ERROR: LiteRT-LM source not found." >&2
     echo "Pass path as argument or clone next to this repo:" >&2
-    echo "  git clone https://github.com/google-ai-edge/LiteRT-LM.git ../LiteRT-LM" >&2
+    echo "  git clone https://github.com/google-ai-edge/LiteRT-LM.git ../LiteRT-LM-ref" >&2
     exit 1
 fi
 
-# Detect platform
+# ============================================================================
+# Detect platform & architecture
+# ============================================================================
+# iOS cross-compilation overrides the native arch detection. On macOS, both
+# arm64 (Apple Silicon) and x86_64 (Intel) are supported — LiteRT-LM uses
+# CPU backend which works on any architecture.
+
 OS=$(uname -s)
 ARCH=$(uname -m)
 
-case "$OS" in
-    Darwin)
-        if [ "$ARCH" = "arm64" ]; then
-            NATIVE_ARCH="macos_arm64"
-            LIB_EXT="dylib"
-        else
-            echo "ERROR: Only arm64 (Apple Silicon) is supported for macOS" >&2; exit 1
-        fi
-        ;;
-    Linux)
-        LIB_EXT="so"
-        case "$ARCH" in
-            x86_64)  NATIVE_ARCH="linux_x86_64" ;;
-            aarch64) NATIVE_ARCH="linux_arm64" ;;
-            *)       echo "ERROR: Unsupported arch: $ARCH" >&2; exit 1 ;;
-        esac
-        ;;
-    *)
-        echo "ERROR: Unsupported OS: $OS (use build_windows.ps1 for Windows)" >&2; exit 1
-        ;;
-esac
+if [ "$IOS_DEVICE" = true ]; then
+    # -----------------------------------------------------------------------
+    # iOS device (arm64) — produces a static library (.a)
+    # Dynamic libraries (.dylib) are not allowed on non-jailbroken iOS.
+    # -----------------------------------------------------------------------
+    NATIVE_ARCH="ios_arm64"
+    LIB_EXT="a"
+    BUILD_STATIC=true
+    BAZEL_EXTRA="--apple_platform_type=ios --cpu=ios_arm64"
+    echo "Target: iOS device (arm64, static library)"
+
+elif [ "$IOS_SIM" = true ]; then
+    # -----------------------------------------------------------------------
+    # iOS simulator (arm64) — also a static library
+    # -----------------------------------------------------------------------
+    NATIVE_ARCH="ios_sim_arm64"
+    LIB_EXT="a"
+    BUILD_STATIC=true
+    BAZEL_EXTRA="--apple_platform_type=ios --cpu=ios_sim_arm64"
+    echo "Target: iOS simulator (arm64, static library)"
+
+elif [ "$OS" = "Darwin" ]; then
+    # -----------------------------------------------------------------------
+    # macOS — shared library (.dylib), works on both arm64 and x86_64.
+    # LiteRT-LM runs on CPU on all three desktop OSes; there's zero reason
+    # to gate macOS builds to arm64 only when Linux x86_64 works fine.
+    # -----------------------------------------------------------------------
+    LIB_EXT="dylib"
+    BUILD_STATIC=false
+    BAZEL_EXTRA=""
+    if [ "$ARCH" = "arm64" ]; then
+        NATIVE_ARCH="macos_arm64"
+    elif [ "$ARCH" = "x86_64" ]; then
+        NATIVE_ARCH="macos_x86_64"
+    else
+        echo "ERROR: Unsupported macOS architecture: $ARCH" >&2
+        exit 1
+    fi
+
+elif [ "$OS" = "Linux" ]; then
+    LIB_EXT="so"
+    BUILD_STATIC=false
+    BAZEL_EXTRA=""
+    case "$ARCH" in
+        x86_64)  NATIVE_ARCH="linux_x86_64" ;;
+        aarch64) NATIVE_ARCH="linux_arm64" ;;
+        *)       echo "ERROR: Unsupported Linux architecture: $ARCH" >&2; exit 1 ;;
+    esac
+
+else
+    echo "ERROR: Unsupported OS: $OS (use build_windows.ps1 for Windows)" >&2
+    exit 1
+fi
 
 OUTPUT_DIR="$REPO_ROOT/prebuilt/$NATIVE_ARCH"
 mkdir -p "$OUTPUT_DIR"
 
 echo "LiteRT-LM source: $LITERT_LM_DIR"
-echo "Platform:          $OS $ARCH ($NATIVE_ARCH)"
+echo "Platform:          $OS $ARCH -> $NATIVE_ARCH"
 echo "Output dir:        $OUTPUT_DIR"
 echo ""
 
@@ -105,13 +161,14 @@ for cmd in bazelisk bazel; do
         break
     fi
 done
+
 if [ -z "$BAZEL" ]; then
     echo "ERROR: bazelisk or bazel not found in PATH" >&2
-    echo "  Install: npm install -g @bazel/bazelisk" >&2
+    echo "  Install: brew install bazelisk  OR  npm install -g @bazel/bazelisk" >&2
     exit 1
 fi
 
-# Run --clean if requested (wipe Bazel cache entirely)
+# Wipe Bazel cache if --clean was passed
 if [ "$CLEAN" = true ]; then
     echo ""
     echo "Running bazel clean --expunge (this wipes the entire cache)..."
@@ -122,8 +179,15 @@ fi
 echo ""
 
 # ============================================================================
-# Create temporary shared library target
+# Temporary source patches
 # ============================================================================
+# We temporarily patch the upstream LiteRT-LM source to:
+#   1. Add x86_64-apple-darwin to the Rust platform triples (Intel Mac)
+#   2. Add a missing C API function (set_dispatch_lib_dir)
+#   3. Create a Bazel build target for the shared/static library
+#   4. Force-export all C API symbols via explicit references
+#
+# Everything is restored on exit (even on error) via the cleanup trap.
 
 echo "Setting up build target..."
 
@@ -131,6 +195,8 @@ BUILD_FILE="$LITERT_LM_DIR/c/BUILD"
 STUB_FILE="$LITERT_LM_DIR/c/capi_dll_entry.cc"
 HEADER_FILE="$LITERT_LM_DIR/c/engine.h"
 SOURCE_FILE="$LITERT_LM_DIR/c/engine.cc"
+
+# Backups — restored by cleanup()
 BUILD_BACKUP="$BUILD_FILE.litert_lm_ffi_backup"
 HEADER_BACKUP="$HEADER_FILE.litert_lm_ffi_backup"
 SOURCE_BACKUP="$SOURCE_FILE.litert_lm_ffi_backup"
@@ -140,6 +206,46 @@ cp "$HEADER_FILE" "$HEADER_BACKUP"
 cp "$SOURCE_FILE" "$SOURCE_BACKUP"
 
 # ============================================================================
+# Patch PATCH.rules_rust: add x86_64-apple-darwin to supported triples
+# ============================================================================
+# The upstream LiteRT-LM repo patches rules_rust's SUPPORTED_PLATFORM_TRIPLES
+# to add iOS/Android, but omits x86_64-apple-darwin (Intel Mac). Without it,
+# the Rust crate resolver marks all crates as @platforms//:incompatible on
+# Intel Macs and the build fails at analysis time.
+#
+# We overwrite the patch file with a corrected version that includes the
+# missing triple. Sed-patching a diff file is too fragile; writing it whole
+# is reliable across all sed implementations (GNU, BSD, busybox).
+
+RULES_RUST_PATCH="$LITERT_LM_DIR/PATCH.rules_rust"
+if [ -f "$RULES_RUST_PATCH" ]; then
+    RULES_RUST_PATCH_BACKUP="$RULES_RUST_PATCH.litert_lm_ffi_backup"
+    cp "$RULES_RUST_PATCH" "$RULES_RUST_PATCH_BACKUP"
+
+    if ! grep -q "x86_64-apple-darwin" "$RULES_RUST_PATCH"; then
+        # Overwrite with corrected patch — upstream + x86_64-apple-darwin
+        cat > "$RULES_RUST_PATCH" << 'PATCHEOF'
+--- crate_universe/private/crates_repository.bzl	2025-05-01 16:41:19.000000000 -0700
++++ crate_universe/private/crates_repository.bzl	2025-06-19 10:31:33.225901444 -0700
+@@ -28,6 +28,10 @@
+ # complexity for each platform triple added.
+ SUPPORTED_PLATFORM_TRIPLES = [
+     "aarch64-apple-darwin",
++    "aarch64-apple-ios",
++    "aarch64-apple-ios-sim",
++    "aarch64-linux-android",
++    "x86_64-apple-darwin",
+     "aarch64-unknown-linux-gnu",
+     "wasm32-unknown-unknown",
+     "wasm32-wasip1",
+PATCHEOF
+        echo "  Patched PATCH.rules_rust: added x86_64-apple-darwin triple"
+    else
+        echo "  PATCH.rules_rust already has x86_64-apple-darwin"
+    fi
+fi
+
+# ============================================================================
 # Patch engine.h: add litert_lm_engine_settings_set_dispatch_lib_dir
 # ============================================================================
 # The upstream C API is missing a setter for the LiteRT dispatch library
@@ -147,7 +253,6 @@ cp "$SOURCE_FILE" "$SOURCE_BACKUP"
 # libraries (libLiteRtWebGpuAccelerator.so, etc.) and crashes during init.
 
 if ! grep -q "litert_lm_engine_settings_set_dispatch_lib_dir" "$HEADER_FILE"; then
-    # Insert declaration before the closing extern "C" brace
     sed -i.bak '/#ifdef __cplusplus/{
         i\
 \
@@ -172,17 +277,15 @@ fi
 # ============================================================================
 
 if ! grep -q "litert_lm_engine_settings_set_dispatch_lib_dir" "$SOURCE_FILE"; then
-    # Insert implementation before the closing }  // extern "C"
     sed -i.bak '/^}  \/\/ extern "C"/i\
 \
 void litert_lm_engine_settings_set_dispatch_lib_dir(\
     LiteRtLmEngineSettings* settings, const char* dir) {\
   if (settings \&\& settings->settings \&\& dir) {\
-    // Set on main executor — this is where the GPU/WebGPU accelerator\
-    // (libLiteRtWebGpuAccelerator.so) gets loaded from.\
+    // Set on main executor — GPU/WebGPU accelerator loads from here\
     settings->settings->GetMutableMainExecutorSettings()\
         .SetLitertDispatchLibDir(dir);\
-    // Also set on vision executor if it exists (returns std::optional).\
+    // Also set on vision executor if it exists (returns std::optional)\
     auto vision = settings->settings->GetMutableVisionExecutorSettings();\
     if (vision.has_value()) {\
       vision->SetLitertDispatchLibDir(dir);\
@@ -193,6 +296,10 @@ void litert_lm_engine_settings_set_dispatch_lib_dir(\
     rm -f "$SOURCE_FILE.bak"
     echo "  Patched engine.cc: added set_dispatch_lib_dir implementation"
 fi
+
+# ============================================================================
+# Create linker stub — forces all C API symbols to survive dead-code stripping
+# ============================================================================
 
 cat > "$STUB_FILE" << 'EOF'
 // =======================================================================
@@ -251,14 +358,43 @@ volatile const void* litert_lm_force_exports[] = {
 };
 EOF
 
+# ============================================================================
+# Append Bazel build target
+# ============================================================================
 # The "engine_alwayslink" wrapper forces the linker to include ALL objects
 # from the :engine cc_library. Combined with the explicit references in
-# capi_dll_entry.cc above, this guarantees all C API symbols are exported.
-cat >> "$BUILD_FILE" << 'EOF'
+# capi_dll_entry.cc, this guarantees all C API symbols are exported.
+
+if [ "$BUILD_STATIC" = true ]; then
+    # iOS: static library — no dynamic linking allowed on non-jailbroken iOS
+    cat >> "$BUILD_FILE" << 'EOF'
+
+# ======================================================================
+# LiteRT-LM-FFI: Static library target for iOS
+# (auto-generated by build_unix.sh — DO NOT COMMIT to LiteRT-LM)
+# ======================================================================
+cc_library(
+    name = "engine_alwayslink",
+    deps = [":engine"],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "litert_lm_capi_static",
+    srcs = ["capi_dll_entry.cc"],
+    deps = [":engine_alwayslink"],
+    visibility = ["//visibility:public"],
+)
+EOF
+    BAZEL_TARGET="//c:litert_lm_capi_static"
+    echo "  Created cc_library target (static): $BAZEL_TARGET"
+else
+    # Desktop: shared library (.dylib / .so) loaded at runtime via FFI
+    cat >> "$BUILD_FILE" << 'EOF'
 
 # ======================================================================
 # LiteRT-LM-FFI: Shared library target
-# (auto-generated by build_unix.sh - DO NOT COMMIT to LiteRT-LM)
+# (auto-generated by build_unix.sh — DO NOT COMMIT to LiteRT-LM)
 # ======================================================================
 cc_library(
     name = "engine_alwayslink",
@@ -274,12 +410,14 @@ cc_binary(
     visibility = ["//visibility:public"],
 )
 EOF
+    BAZEL_TARGET="//c:litert_lm_capi"
+    echo "  Created cc_binary(linkshared=True) target: $BAZEL_TARGET"
+fi
 
-echo "  Created cc_binary(linkshared=True) target: //c:litert_lm_capi"
 echo ""
 
 # ============================================================================
-# Cleanup on exit
+# Cleanup on exit — restores all patched files, even on error
 # ============================================================================
 
 cleanup() {
@@ -304,75 +442,117 @@ cleanup() {
         rm -f "$STUB_FILE"
         echo "  Removed capi_dll_entry.cc"
     fi
+    if [ -n "${RULES_RUST_PATCH_BACKUP:-}" ] && [ -f "$RULES_RUST_PATCH_BACKUP" ]; then
+        cp "$RULES_RUST_PATCH_BACKUP" "$RULES_RUST_PATCH"
+        rm -f "$RULES_RUST_PATCH_BACKUP"
+        echo "  Restored original PATCH.rules_rust"
+    fi
 }
 trap cleanup EXIT
 
 # ============================================================================
-# Build
+# Build with Bazel
 # ============================================================================
 
-echo "Building LiteRT-LM C API shared library..."
+echo "Building LiteRT-LM C API library..."
 echo "  First build downloads deps + compiles everything (~5-15 min)"
 echo "  Subsequent builds are near-instant (Bazel caches everything)"
 echo ""
 
 cd "$LITERT_LM_DIR"
 
-$BAZEL build //c:litert_lm_capi
+# shellcheck disable=SC2086
+$BAZEL build $BAZEL_TARGET $BAZEL_EXTRA
 
 echo ""
 echo "Build succeeded!"
 
 # ============================================================================
-# Copy output
+# Copy output to prebuilt directory
 # ============================================================================
 
 echo ""
 echo "Copying build output..."
 
-LIB_PATH=""
-for candidate in \
-    "$LITERT_LM_DIR/bazel-bin/c/litert_lm_capi.$LIB_EXT" \
-    "$LITERT_LM_DIR/bazel-bin/c/liblitert_lm_capi.$LIB_EXT" \
-    "$LITERT_LM_DIR/bazel-bin/c/litert_lm_capi"; do
-    if [ -f "$candidate" ]; then
-        LIB_PATH="$candidate"
-        break
-    fi
-done
-
-if [ -n "$LIB_PATH" ]; then
-    if [ "$OS" = "Darwin" ]; then
-        OUT_NAME="liblitert_lm_capi.dylib"
-    else
-        OUT_NAME="liblitert_lm_capi.so"
-    fi
-
-    cp "$LIB_PATH" "$OUTPUT_DIR/$OUT_NAME"
-    size=$(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1)
-    echo "  $OUT_NAME ($size)"
-
-    if [ "$OS" = "Darwin" ]; then
-        codesign --force --sign - "$OUTPUT_DIR/$OUT_NAME" 2>/dev/null || true
-        echo "  Signed: $OUT_NAME"
-    fi
-else
-    echo "  WARNING: Shared library not found in bazel-bin/c/" >&2
-    ls -la "$LITERT_LM_DIR/bazel-bin/c/" 2>/dev/null || true
-fi
-
-# Copy prebuilt accelerator libraries
-PREBUILT_DIR="$LITERT_LM_DIR/prebuilt/$NATIVE_ARCH"
-if [ -d "$PREBUILT_DIR" ]; then
-    for lib in "$PREBUILT_DIR"/*.$LIB_EXT "$PREBUILT_DIR"/*.so; do
-        [ -f "$lib" ] || continue
-        filename=$(basename "$lib")
-        cp "$lib" "$OUTPUT_DIR/$filename"
-        echo "  $filename (accelerator)"
-        if [ "$OS" = "Darwin" ]; then
-            codesign --force --sign - "$OUTPUT_DIR/$filename" 2>/dev/null || true
+if [ "$BUILD_STATIC" = true ]; then
+    # -----------------------------------------------------------------------
+    # iOS static library — Bazel outputs a .a archive
+    # -----------------------------------------------------------------------
+    LIB_PATH=""
+    for candidate in \
+        "$LITERT_LM_DIR/bazel-bin/c/liblitert_lm_capi_static.a" \
+        "$LITERT_LM_DIR/bazel-bin/c/litert_lm_capi_static.a"; do
+        if [ -f "$candidate" ]; then
+            LIB_PATH="$candidate"
+            break
         fi
     done
+
+    if [ -n "$LIB_PATH" ]; then
+        OUT_NAME="liblitert_lm_capi.a"
+        cp "$LIB_PATH" "$OUTPUT_DIR/$OUT_NAME"
+        size=$(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1)
+        echo "  $OUT_NAME ($size)"
+    else
+        echo "  WARNING: Static library not found in bazel-bin/c/" >&2
+        ls -la "$LITERT_LM_DIR/bazel-bin/c/" 2>/dev/null || true
+    fi
+else
+    # -----------------------------------------------------------------------
+    # Desktop shared library (.dylib / .so)
+    # -----------------------------------------------------------------------
+    LIB_PATH=""
+    for candidate in \
+        "$LITERT_LM_DIR/bazel-bin/c/litert_lm_capi.$LIB_EXT" \
+        "$LITERT_LM_DIR/bazel-bin/c/liblitert_lm_capi.$LIB_EXT" \
+        "$LITERT_LM_DIR/bazel-bin/c/litert_lm_capi"; do
+        if [ -f "$candidate" ]; then
+            LIB_PATH="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$LIB_PATH" ]; then
+        if [ "$OS" = "Darwin" ]; then
+            OUT_NAME="liblitert_lm_capi.dylib"
+        else
+            OUT_NAME="liblitert_lm_capi.so"
+        fi
+
+        cp "$LIB_PATH" "$OUTPUT_DIR/$OUT_NAME"
+        size=$(du -h "$OUTPUT_DIR/$OUT_NAME" | cut -f1)
+        echo "  $OUT_NAME ($size)"
+
+        # Ad-hoc codesign on macOS so Gatekeeper doesn't reject it
+        if [ "$OS" = "Darwin" ]; then
+            codesign --force --sign - "$OUTPUT_DIR/$OUT_NAME" 2>/dev/null || true
+            echo "  Signed: $OUT_NAME"
+        fi
+    else
+        echo "  WARNING: Shared library not found in bazel-bin/c/" >&2
+        ls -la "$LITERT_LM_DIR/bazel-bin/c/" 2>/dev/null || true
+    fi
+fi
+
+# ============================================================================
+# Copy prebuilt accelerator libraries (GPU/WebGPU — desktop only)
+# ============================================================================
+# These are separate .dylib/.so files shipped by Google in the LiteRT-LM repo
+# under prebuilt/<arch>/. iOS doesn't use these (Metal is handled differently).
+
+if [ "$BUILD_STATIC" = false ]; then
+    PREBUILT_DIR="$LITERT_LM_DIR/prebuilt/$NATIVE_ARCH"
+    if [ -d "$PREBUILT_DIR" ]; then
+        for lib in "$PREBUILT_DIR"/*."$LIB_EXT" "$PREBUILT_DIR"/*.so; do
+            [ -f "$lib" ] || continue
+            filename=$(basename "$lib")
+            cp "$lib" "$OUTPUT_DIR/$filename"
+            echo "  $filename (accelerator)"
+            if [ "$OS" = "Darwin" ]; then
+                codesign --force --sign - "$OUTPUT_DIR/$filename" 2>/dev/null || true
+            fi
+        done
+    fi
 fi
 
 # ============================================================================
@@ -391,5 +571,10 @@ for f in "$OUTPUT_DIR"/*; do
     echo "  $(basename "$f") ($size)"
 done
 echo ""
-echo "Load the shared library from your app via FFI (Dart, Python, Rust, Go, C#, etc.)"
-echo "See include/engine.h for the full C API reference."
+
+if [ "$BUILD_STATIC" = true ]; then
+    echo "Static library ready for linking into your iOS app."
+else
+    echo "Load the shared library from your app via FFI (Dart, Python, Rust, Go, C#, etc.)"
+    echo "See include/engine.h for the full C API reference."
+fi
