@@ -201,9 +201,13 @@ BUILD_BACKUP="$BUILD_FILE.litert_lm_ffi_backup"
 HEADER_BACKUP="$HEADER_FILE.litert_lm_ffi_backup"
 SOURCE_BACKUP="$SOURCE_FILE.litert_lm_ffi_backup"
 
+LOCKFILE="$LITERT_LM_DIR/cargo-bazel-lock.json"
+LOCKFILE_BACKUP="$LOCKFILE.litert_lm_ffi_backup"
+
 cp "$BUILD_FILE" "$BUILD_BACKUP"
 cp "$HEADER_FILE" "$HEADER_BACKUP"
 cp "$SOURCE_FILE" "$SOURCE_BACKUP"
+[ -f "$LOCKFILE" ] && cp "$LOCKFILE" "$LOCKFILE_BACKUP"
 
 # ============================================================================
 # Patch PATCH.rules_rust: add x86_64-apple-darwin to supported triples
@@ -447,6 +451,11 @@ cleanup() {
         rm -f "$RULES_RUST_PATCH_BACKUP"
         echo "  Restored original PATCH.rules_rust"
     fi
+    if [ -n "${LOCKFILE_BACKUP:-}" ] && [ -f "$LOCKFILE_BACKUP" ]; then
+        cp "$LOCKFILE_BACKUP" "$LOCKFILE"
+        rm -f "$LOCKFILE_BACKUP"
+        echo "  Restored original cargo-bazel-lock.json"
+    fi
 }
 trap cleanup EXIT
 
@@ -461,8 +470,23 @@ echo ""
 
 cd "$LITERT_LM_DIR"
 
+# CARGO_BAZEL_REPIN=true regenerates the crate lockfile when our
+# PATCH.rules_rust adds new platform triples (e.g. x86_64-apple-darwin)
+# that change the crate resolution digest.
+#
+# On macOS, pass DEVELOPER_DIR so Bazel's toolchain recognises Xcode system
+# headers even if Xcode is installed at a non-standard path (e.g.
+# /Volumes/NVMe/Xcode.app instead of /Applications/Xcode.app).
+BAZEL_MACOS_FLAGS=""
+if [ "$OS" = "Darwin" ]; then
+    XCODE_DEV_DIR="$(xcode-select -p 2>/dev/null || echo "")"
+    if [ -n "$XCODE_DEV_DIR" ]; then
+        BAZEL_MACOS_FLAGS="--repo_env=DEVELOPER_DIR=$XCODE_DEV_DIR"
+    fi
+fi
+
 # shellcheck disable=SC2086
-$BAZEL build $BAZEL_TARGET $BAZEL_EXTRA
+CARGO_BAZEL_REPIN=true $BAZEL build $BAZEL_TARGET $BAZEL_EXTRA $BAZEL_MACOS_FLAGS
 
 echo ""
 echo "Build succeeded!"
